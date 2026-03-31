@@ -327,15 +327,44 @@ fn walk_lines(chip_num: u32, start: u32, end: u32) {
         return;
     }
 
-    println!("=== Walking {} lines {} to {} ===", chip_path, start, end);
-    println!("Each line will be held HIGH for 5 seconds, then LOW for 1 second.");
-    println!("Watch the front panel LEDs and note which line number lights them up!");
-    println!("Ctrl+C to stop at any time.\n");
-    println!("Starting in 3 seconds...");
-    thread::sleep(Duration::from_secs(3));
+    // Phase 1: Quick scan to find which lines are actually requestable
+    println!("=== Scanning {} lines {} to {} for usable pins... ===\n", chip_path, start, end);
+    let mut usable_lines: Vec<u32> = Vec::new();
 
     for line_num in start..=end {
-        print!(">>> Line {:>3}/{} — ", line_num, end);
+        match Chip::new(&chip_path) {
+            Ok(mut chip) => {
+                if let Ok(line) = chip.get_line(line_num) {
+                    if let Ok(handle) = line.request(LineRequestFlags::OUTPUT, 0, "gpio_scan") {
+                        // Can request it — it's usable
+                        let _ = handle.set_value(0); // reset to LOW
+                        usable_lines.push(line_num);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    println!("Found {} usable lines out of {} total (skipped {} locked/reserved)",
+        usable_lines.len(), end - start + 1, (end - start + 1) as usize - usable_lines.len());
+    println!("Usable lines: {:?}\n", usable_lines);
+
+    if usable_lines.is_empty() {
+        println!("No usable lines in this range.");
+        return;
+    }
+
+    let total = usable_lines.len();
+    let eta_secs = total * 3; // 2s ON + 1s OFF per line
+    println!("Will test {} lines, ~2s each = ~{} seconds total", total, eta_secs);
+    println!("Watch the front panel LEDs! Note the line number when one lights up.");
+    println!("Ctrl+C to stop.\n");
+    thread::sleep(Duration::from_secs(2));
+
+    // Phase 2: Walk only the usable lines
+    for (i, &line_num) in usable_lines.iter().enumerate() {
+        print!("[{}/{}] Line {:>3} — ", i + 1, total, line_num);
 
         match Chip::new(&chip_path) {
             Ok(mut chip) => match chip.get_line(line_num) {
@@ -348,24 +377,23 @@ fn walk_lines(chip_num: u32, start: u32, end: u32) {
                                 continue;
                             }
                             let readback = handle.get_value().unwrap_or(99);
-                            println!("HIGH (read={}) — LED on? Watching 5s...", readback);
+                            println!("HIGH (read={}) — watching 2s...", readback);
 
-                            thread::sleep(Duration::from_secs(5));
+                            thread::sleep(Duration::from_secs(2));
 
                             // Set LOW
                             handle.set_value(0).ok();
-                            println!("    Line {:>3} — LOW (off)", line_num);
 
-                            thread::sleep(Duration::from_secs(1));
+                            thread::sleep(Duration::from_millis(500));
                         }
                         Err(_) => {
-                            println!("SKIP (pin reserved/locked)");
+                            println!("SKIP");
                         }
                     }
                 }
-                Err(_) => println!("SKIP (error)"),
+                Err(_) => println!("SKIP"),
             },
-            Err(_) => println!("SKIP (chip error)"),
+            Err(_) => println!("SKIP"),
         }
     }
 
