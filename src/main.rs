@@ -7,6 +7,7 @@ use std::time::Duration;
 fn print_usage() {
     println!("Usage:");
     println!("  gpio_pin                         # Scan and list all GPIO lines (no toggle)");
+    println!("  gpio_pin walk <chip> [start] [end]  # Walk through lines one by one (5s each)");
     println!("  gpio_pin scan                    # Scan and toggle all lines (original behavior)");
     println!("  gpio_pin blink <chip> <line>     # Blink a specific GPIO line repeatedly");
     println!("  gpio_pin test <chip> <line>      # Test a line with both active-high and active-low");
@@ -15,6 +16,8 @@ fn print_usage() {
     println!();
     println!("Examples:");
     println!("  sudo ./gpio_pin                          # Just list all GPIO lines");
+    println!("  sudo ./gpio_pin walk 0                   # Walk ALL lines on gpiochip0, 5s each");
+    println!("  sudo ./gpio_pin walk 0 0 20              # Walk lines 0-20 on gpiochip0");
     println!("  sudo ./gpio_pin blink 0 4                # Blink gpiochip0 line 4");
     println!("  sudo ./gpio_pin test 0 4                 # Test gpiochip0 line 4 (both polarities)");
     println!("  sudo ./gpio_pin on 0 4                   # Set gpiochip0 line 4 HIGH and hold");
@@ -306,6 +309,69 @@ fn hold_line(chip_num: u32, line_num: u32, value: u8) {
     }
 }
 
+fn walk_lines(chip_num: u32, start: u32, end: u32) {
+    let chip_path = format!("/dev/gpiochip{}", chip_num);
+
+    // First, figure out how many lines the chip has
+    let max_lines = match Chip::new(&chip_path) {
+        Ok(chip) => chip.num_lines(),
+        Err(e) => {
+            println!("Could not open {}: {}", chip_path, e);
+            return;
+        }
+    };
+
+    let end = end.min(max_lines - 1);
+    if start > end {
+        println!("Invalid range: start ({}) > end ({})", start, end);
+        return;
+    }
+
+    println!("=== Walking {} lines {} to {} ===", chip_path, start, end);
+    println!("Each line will be held HIGH for 5 seconds, then LOW for 1 second.");
+    println!("Watch the front panel LEDs and note which line number lights them up!");
+    println!("Ctrl+C to stop at any time.\n");
+    println!("Starting in 3 seconds...");
+    thread::sleep(Duration::from_secs(3));
+
+    for line_num in start..=end {
+        print!(">>> Line {:>3}/{} — ", line_num, end);
+
+        match Chip::new(&chip_path) {
+            Ok(mut chip) => match chip.get_line(line_num) {
+                Ok(line) => {
+                    match line.request(LineRequestFlags::OUTPUT, 0, "gpio_walk") {
+                        Ok(handle) => {
+                            // Set HIGH
+                            if let Err(e) = handle.set_value(1) {
+                                println!("HIGH failed: {}", e);
+                                continue;
+                            }
+                            let readback = handle.get_value().unwrap_or(99);
+                            println!("HIGH (read={}) — LED on? Watching 5s...", readback);
+
+                            thread::sleep(Duration::from_secs(5));
+
+                            // Set LOW
+                            handle.set_value(0).ok();
+                            println!("    Line {:>3} — LOW (off)", line_num);
+
+                            thread::sleep(Duration::from_secs(1));
+                        }
+                        Err(_) => {
+                            println!("SKIP (pin reserved/locked)");
+                        }
+                    }
+                }
+                Err(_) => println!("SKIP (error)"),
+            },
+            Err(_) => println!("SKIP (chip error)"),
+        }
+    }
+
+    println!("\n=== Walk complete (lines {} to {}) ===", start, end);
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
 
@@ -320,6 +386,18 @@ fn main() {
     match args[1].as_str() {
         "--help" | "-h" | "help" => {
             print_usage();
+        }
+        "walk" => {
+            if args.len() < 3 {
+                println!("Usage: gpio_pin walk <chip_number> [start_line] [end_line]");
+                println!("Example: gpio_pin walk 0          # all lines on chip 0");
+                println!("Example: gpio_pin walk 0 0 20     # lines 0-20 on chip 0");
+                return;
+            }
+            let chip_num: u32 = args[2].parse().expect("chip must be a number");
+            let start: u32 = if args.len() > 3 { args[3].parse().unwrap_or(0) } else { 0 };
+            let end: u32 = if args.len() > 4 { args[4].parse().unwrap_or(u32::MAX) } else { u32::MAX };
+            walk_lines(chip_num, start, end);
         }
         "scan" => {
             scan_and_toggle_all();
