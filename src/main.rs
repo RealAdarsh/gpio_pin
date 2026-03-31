@@ -1,5 +1,6 @@
 use gpio_cdev::{Chip, LineRequestFlags};
 use std::env;
+use std::fs;
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
@@ -7,7 +8,8 @@ use std::time::Duration;
 fn print_usage() {
     println!("Usage:");
     println!("  gpio_pin                         # Scan and list all GPIO lines (no toggle)");
-    println!("  gpio_pin walk <chip> [start] [end]  # Walk through lines one by one (5s each)");
+    println!("  gpio_pin identify                    # Auto-find COMe GPO/LED pins and blink them");
+    println!("  gpio_pin walk <chip> [start] [end]  # Walk through lines one by one (2s each)");
     println!("  gpio_pin scan                    # Scan and toggle all lines (original behavior)");
     println!("  gpio_pin blink <chip> <line>     # Blink a specific GPIO line repeatedly");
     println!("  gpio_pin test <chip> <line>      # Test a line with both active-high and active-low");
@@ -400,6 +402,156 @@ fn walk_lines(chip_num: u32, start: u32, end: u32) {
     println!("\n=== Walk complete (lines {} to {}) ===", start, end);
 }
 
+fn identify_come_gpios() {
+    println!("=== Auto-Identifying COMe GPO / LED GPIO Lines ===\n");
+
+    // Strategy 1: Check /sys/kernel/debug/gpio for named pins
+    println!("--- Strategy 1: Checking /sys/kernel/debug/gpio for COMe/GPO/LED names ---");
+    match fs::read_to_string("/sys/kernel/debug/gpio") {
+        Ok(content) => {
+            let keywords = ["gpo", "come", "led", "exp", "gpio_exp", "front"];
+            let mut found = false;
+            for line in content.lines() {
+                let lower = line.to_lowercase();
+                if keywords.iter().any(|kw| lower.contains(kw)) {
+                    println!("  MATCH: {}", line.trim());
+                    found = true;
+                }
+            }
+            if !found {
+                println!("  No named matches found in debug/gpio");
+            }
+            println!();
+
+            // Also print the full dump for reference
+            println!("--- Full /sys/kernel/debug/gpio dump ---");
+            for line in content.lines() {
+                println!("  {}", line);
+            }
+            println!();
+        }
+        Err(e) => {
+            println!("  Could not read /sys/kernel/debug/gpio: {}", e);
+            println!("  (Run with sudo)\n");
+        }
+    }
+
+    // Strategy 2: Scan all GPIO chips for named lines matching COMe patterns
+    println!("--- Strategy 2: Scanning gpiochip lines for COMe/GPO/LED names ---");
+    let mut chip_index = 0;
+    let mut come_lines: Vec<(u32, u32, String)> = Vec::new(); // (chip, line, name)
+
+    loop {
+        let chip_path = format!("/dev/gpiochip{}", chip_index);
+        if !Path::new(&chip_path).exists() {
+            break;
+        }
+
+        if let Ok(mut chip) = Chip::new(&chip_path) {
+            let num_lines = chip.num_lines();
+            for offset in 0..num_lines {
+                if let Ok(line) = chip.get_line(offset) {
+                    if let Ok(info) = line.info() {
+                        let name = info.name().unwrap_or("").to_lowercase();
+                        let consumer = info.consumer().unwrap_or("").to_lowercase();
+
+                        let keywords = ["gpo", "come", "led", "exp", "front", "panel"];
+                        if keywords.iter().any(|kw| name.contains(kw) || consumer.contains(kw)) {
+                            println!("  FOUND: gpiochip{} line {} — name=\"{}\" consumer=\"{}\"",
+                                chip_index, offset,
+                                info.name().unwrap_or("unnamed"),
+                                info.consumer().unwrap_or("free")
+                            );
+                            come_lines.push((chip_index as u32, offset, name.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        chip_index += 1;
+    }
+
+    // Strategy 3: Check ACPI/device-tree for GPIO mappings
+    println!("\n--- Strategy 3: Checking ACPI/platform GPIO info ---");
+
+    // Check pinctrl debug info
+    if let Ok(entries) = fs::read_dir("/sys/kernel/debug/pinctrl") {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+
+            // Read the pin groups and GPIO ranges
+            let gpio_ranges_path = path.join("gpio-ranges");
+            if let Ok(content) = fs::read_to_string(&gpio_ranges_path) {
+                println!("  {}/gpio-ranges:", name);
+                for line in content.lines() {
+                    println!("    {}", line);
+                }
+            }
+        }
+    } else {
+        println!("  Could not read /sys/kernel/debug/pinctrl (run with sudo)");
+    }
+
+    // Strategy 4: Check for ACPI GPIO consumer info
+    println!("\n--- Strategy 4: Checking /sys/bus/gpio/devices for info ---");
+    if let Ok(entries) = fs::read_dir("/sys/bus/gpio/devices") {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let chip_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+
+            // Read label
+            let label_path = path.join("label");
+            let label = fs::read_to_string(&label_path).unwrap_or_else(|_| "unknown".to_string());
+
+            // Read ngpio
+            let ngpio_path = path.join("ngpio");
+            let ngpio = fs::read_to_string(&ngpio_path).unwrap_or_else(|_| "?".to_string());
+
+            // Read base
+            let base_path = path.join("base");
+            let base = fs::read_to_string(&base_path).unwrap_or_else(|_| "?".to_string());
+
+            println!("  {} — label: {} base: {} ngpio: {}",
+                chip_name, label.trim(), base.trim(), ngpio.trim());
+        }
+    }
+
+    println!();
+
+    if !come_lines.is_empty() {
+        println!("=== FOUND {} potential COMe GPIO lines! Blinking them now... ===\n", come_lines.len());
+
+        for (chip, line, name) in &come_lines {
+            let chip_path = format!("/dev/gpiochip{}", chip);
+            println!("Blinking gpiochip{} line {} ({})...", chip, line, name);
+
+            if let Ok(mut c) = Chip::new(&chip_path) {
+                if let Ok(l) = c.get_line(*line) {
+                    if let Ok(handle) = l.request(LineRequestFlags::OUTPUT, 0, "gpio_identify") {
+                        for _ in 0..5 {
+                            handle.set_value(1).ok();
+                            thread::sleep(Duration::from_secs(1));
+                            handle.set_value(0).ok();
+                            thread::sleep(Duration::from_secs(1));
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        println!("=== No named COMe/GPO lines found ===");
+        println!();
+        println!("The GPIO lines on this system are unnamed (all show as 'unnamed').");
+        println!("This is common — the BIOS didn't label them.");
+        println!();
+        println!("To find your 4 COMe LED pins, run:");
+        println!("  sudo ./gpio_pin walk 0");
+        println!();
+        println!("Or provide the COMe module model number so we can look up the pin mapping.");
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
 
@@ -414,6 +566,9 @@ fn main() {
     match args[1].as_str() {
         "--help" | "-h" | "help" => {
             print_usage();
+        }
+        "identify" => {
+            identify_come_gpios();
         }
         "walk" => {
             if args.len() < 3 {
